@@ -1,1 +1,1 @@
-{"homeAlias":"/","nodes":{},"links":[]}
+{"homeAlias":"/","nodes":{"/dawg/":{"id":0,"title":"Dawg","url":"/dawg/","group":"none","home":false,"outBound":[],"neighbors":[],"backLinks":[],"hide":false,"size":0},"/":{"id":1,"title":"notes","url":"/","group":"none","home":true,"outBound":[],"neighbors":[],"backLinks":[],"hide":false,"size":0}},"links":[]}
