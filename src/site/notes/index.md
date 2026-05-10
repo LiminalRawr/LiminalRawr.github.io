@@ -1,5 +1,5 @@
 ---
-{"dg-publish":true,"permalink":"/index/","tags":["gardenEntry"],"dg-note-properties":{}}
+{"dg-publish":true,"permalink":"/index/","tags":["gardenEntry"],"dg-note-properties":{"order":0}}
 ---
 
 
@@ -11,7 +11,34 @@
 
 ***
 
+![GKu_OlvbMAAKqLR.jpg](/img/user/GKu_OlvbMAAKqLR.jpg)
 
-![GKu_OlvbMAAKqLR 1.jpg](/img/user/GKu_OlvbMAAKqLR%201.jpg)
-<center>Don't mind this!</center>
 
+
+ <center>Don't mind this!</center>
+
+
+
+<div class="transclusion internal-embed is-loaded"><div class="markdown-embed">
+
+
+
+
+
+## Test
+
+- [ ] Rawr
+- [ ] Rawr 2
+
+
+## Test 2
+
+- [ ] Nya
+- [ ] Nya 2
+
+
+
+
+
+
+</div></div>
