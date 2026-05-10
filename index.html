@@ -23,7 +23,6 @@
 <link rel="manifest" href="/manifest.webmanifest">
 <style></style>
 </head>
-<body class="theme-dark markdown-preview-view markdown-rendered markdown-preview-section">
 <nav class="navbar">
 <div class="navbar-inner">
 <a href="/" style="text-decoration:none">
@@ -31,12 +30,746 @@
 </a>
 </div>
 </nav>
-<main class="content cm-s-obsidian">
 <header>
 <div class="header-meta">
 </div>
 </header>
-</main>
+<div class="transclusion internal-embed is-loaded"></div>
+<pre><code class="language-dataviewjs">// 1. Configuration – separate JSON file
+
+const CONFIG_FILE = &quot;.kanban/kanban-config.json&quot;;
+
+// Default settings (used if config file doesn't exist)
+const DEFAULT_CONFIG = {
+  folder: &quot;/&quot;,
+  excludePaths: [&quot;_templates/&quot;, &quot;attachments/&quot;, &quot;Clippings/&quot;, &quot;Life/Daily Notes/&quot;],
+  excludeTags: [&quot;#Homepage&quot;, &quot;#foldernote&quot;],
+  defaultCardLimit: 10,
+  columns: [
+    { id: &quot;to-do&quot;, label: &quot;To-Do&quot; },
+    { id: &quot;in-progress&quot;, label: &quot;In Progress&quot; },
+    { id: &quot;on-hold&quot;, label: &quot;On Hold&quot; },
+    { id: &quot;someday&quot;, label: &quot;Someday&quot; },
+    { id: &quot;done&quot;, label: &quot;Done&quot; }
+  ],
+  folderColors: {
+    &quot;Azmeen&quot;: &quot;#003166&quot;,
+    &quot;Life&quot;: &quot;#ff5757&quot;,
+    &quot;Corner&quot;: &quot;#91b60c&quot;,
+    &quot;3Diculous&quot;: &quot;#6c045e&quot;,
+    &quot;Fuel-Forge&quot;: &quot;#Fb752d&quot;
+  },
+  progressColors: {
+    0: &quot;var(--text-faint)&quot;,
+    1: &quot;#bf4097&quot;,
+    2: &quot;#5540bf&quot;,
+    3: &quot;#30bfbd&quot;,
+    4: &quot;#a4bf40&quot;,
+    5: &quot;#bf4a40&quot;
+  }
+};
+
+// Global mutable variables (will be set by loadConfig)
+let FOLDER, EXCLUDE_PATHS, EXCLUDE_TAGS, COLUMNS, FOLDER_COLOR_MAP, PROGRESS_COLORS, DEFAULT_LIMIT;
+
+// Load config (creates file and folder automatically if needed)
+async function loadConfig() {
+  try {
+    const exists = await app.vault.adapter.exists(CONFIG_FILE);
+    if (!exists) {
+      await app.vault.create(CONFIG_FILE, JSON.stringify(DEFAULT_CONFIG, null, 2));
+    }
+    const content = await app.vault.adapter.read(CONFIG_FILE);
+    const config = JSON.parse(content);
+    FOLDER = config.folder;
+    EXCLUDE_PATHS = config.excludePaths;
+    EXCLUDE_TAGS = config.excludeTags;
+    COLUMNS = config.columns;
+    FOLDER_COLOR_MAP = config.folderColors;
+    PROGRESS_COLORS = config.progressColors || DEFAULT_CONFIG.progressColors;
+    DEFAULT_LIMIT = config.defaultCardLimit || DEFAULT_CONFIG.defaultCardLimit;
+  } catch (e) {
+    console.error(&quot;Using default config due to error:&quot;, e);
+    FOLDER = DEFAULT_CONFIG.folder;
+    EXCLUDE_PATHS = DEFAULT_CONFIG.excludePaths;
+    EXCLUDE_TAGS = DEFAULT_CONFIG.excludeTags;
+    COLUMNS = DEFAULT_CONFIG.columns;
+    FOLDER_COLOR_MAP = DEFAULT_CONFIG.folderColors;
+    PROGRESS_COLORS = DEFAULT_CONFIG.progressColors;
+    DEFAULT_LIMIT = DEFAULT_CONFIG.defaultCardLimit;
+  }
+}
+
+async function saveConfig(newConfig) {
+  try {
+    const exists = await app.vault.adapter.exists(CONFIG_FILE);
+    if (!exists) {
+      await app.vault.create(CONFIG_FILE, JSON.stringify(newConfig, null, 2));
+    } else {
+      await app.vault.adapter.write(CONFIG_FILE, JSON.stringify(newConfig, null, 2));
+    }
+  } catch (e) {
+    console.error(&quot;Save config failed:&quot;, e);
+    throw e;
+  }
+}
+
+// ───────────────────────────────────────────────────────────────────────────────
+// 2. Persistent state (drag overrides, collapsed columns, etc.)
+// ───────────────────────────────────────────────────────────────────────────────
+const STATE_KEY = &quot;kb_&quot; + dv.currentFilePath.replace(/[^\w]/g, &quot;_&quot;);
+if (!window[STATE_KEY]) {
+  window[STATE_KEY] = { ov: {}, orderOv: {}, collapsed: {} };
+}
+const STATE = window[STATE_KEY];
+const DRAG = { path: null };
+
+// ───────────────────────────────────────────────────────────────────────────────
+// 3. Helper: get root folder name from file path
+// ───────────────────────────────────────────────────────────────────────────────
+function getRootFolder(path) {
+  const parts = path.split('/');
+  return parts.length &gt; 1 ? parts[0] : &quot;&quot;;
+}
+
+// ───────────────────────────────────────────────────────────────────────────────
+// 4. File I/O for task status/order (unchanged, uses frontmatter patch)
+// ───────────────────────────────────────────────────────────────────────────────
+async function patchFrontmatter(path, patches) {
+  const file = app.vault.getAbstractFileByPath(path);
+  if (!file) return;
+  let content = await app.vault.read(file);
+  const m = content.match(/^---\r?\n([\s\S]*?)\r?\n---/);
+  if (!m) return;
+  let fm = m[1];
+  for (const [key, val] of Object.entries(patches)) {
+    const re = new RegExp(`^(${key}:\\s*).*$`, &quot;m&quot;);
+    fm = re.test(fm) ? fm.replace(re, `$1${val}`) : `${fm}\n${key}: ${val}`;
+  }
+  await app.vault.modify(file, content.replace(m[0], `---\n${fm}\n---`));
+}
+
+// ───────────────────────────────────────────────────────────────────────────────
+// 5. Task list and filtering
+// ───────────────────────────────────────────────────────────────────────────────
+let pages = [];
+
+function refreshPages() {
+  pages = dv.pages(`&quot;${FOLDER}&quot;`).array().filter(p =&gt; {
+    const path = p.file.path;
+    if (EXCLUDE_PATHS.some(ex =&gt; path.includes(ex))) return false;
+    const noteTags = p.file.tags || [];
+    if (EXCLUDE_TAGS.some(tag =&gt; noteTags.includes(tag))) return false;
+    return true;
+  });
+  
+  // Purge stale overrides
+  for (const p of Object.keys(STATE.ov)) {
+    const pg = pages.find(x =&gt; x.file.path === p);
+    if (pg &amp;&amp; pg.status === STATE.ov[p]) delete STATE.ov[p];
+  }
+  for (const p of Object.keys(STATE.orderOv)) {
+    const pg = pages.find(x =&gt; x.file.path === p);
+    if (pg &amp;&amp; pg.order === STATE.orderOv[p]) delete STATE.orderOv[p];
+  }
+}
+
+function buildTasks() {
+  return pages.map((p, i) =&gt; ({
+    path: p.file.path,
+    title: p.title || p.file.name,
+    status: STATE.ov[p.file.path] ?? p.status ?? &quot;to-do&quot;,
+    progress: typeof p.progress === &quot;number&quot; ? p.progress : null,
+    order: STATE.orderOv[p.file.path] ?? (typeof p.order === &quot;number&quot; ? p.order : i),
+    tags: p.file.tags || [],
+  }));
+}
+
+function byOrder(arr) {
+  return [...arr].sort((a, b) =&gt; a.order - b.order);
+}
+
+// ───────────────────────────────────────────────────────────────────────────────
+// 6. Drag &amp; drop / move commit functions (unchanged)
+// ───────────────────────────────────────────────────────────────────────────────
+function clearDropUI() {
+  dv.container.querySelectorAll(&quot;.kb-col-over&quot;).forEach(el =&gt; el.classList.remove(&quot;kb-col-over&quot;));
+}
+
+function commitColumnChange(srcPath, targetColId) {
+  const tasks = buildTasks();
+  const src = tasks.find(t =&gt; t.path === srcPath);
+  if (!src || src.status === targetColId) return;
+  const colTasks = byOrder(tasks.filter(t =&gt; t.status === targetColId));
+  const newOrder = colTasks.length ? Math.max(...colTasks.map(t =&gt; t.order)) + 1 : 0;
+  STATE.ov[srcPath] = targetColId;
+  STATE.orderOv[srcPath] = newOrder;
+  renderFullBoard();
+  patchFrontmatter(srcPath, { status: targetColId, order: newOrder }).catch(console.error);
+}
+
+function commitMove(srcPath, dir) {
+  const tasks = buildTasks();
+  const src = tasks.find(t =&gt; t.path === srcPath);
+  if (!src) return;
+  const colTasks = byOrder(tasks.filter(t =&gt; t.status === src.status));
+  const idx = colTasks.findIndex(t =&gt; t.path === srcPath);
+  const newIdx = dir === &quot;up&quot; ? idx - 1 : idx + 1;
+  if (newIdx &lt; 0 || newIdx &gt;= colTasks.length) return;
+  [colTasks[idx], colTasks[newIdx]] = [colTasks[newIdx], colTasks[idx]];
+  colTasks.forEach((t, i) =&gt; { STATE.orderOv[t.path] = i; });
+  renderFullBoard();
+  colTasks.forEach(t =&gt; patchFrontmatter(t.path, { order: STATE.orderOv[t.path] }).catch(console.error));
+}
+
+// ───────────────────────────────────────────────────────────────────────────────
+// 7. Rendering functions
+// ───────────────────────────────────────────────────────────────────────────────
+function renderBoard() {
+  const root = dv.container;
+  const tasks = buildTasks();
+  const totalBefore = dv.pages(`&quot;${FOLDER}&quot;`).length;
+  const statusBar = root.createEl(&quot;div&quot;, { cls: &quot;kb-status&quot; });
+  statusBar.createEl(&quot;span&quot;, { 
+    text: `${pages.length} notes loaded (${totalBefore - pages.length} excluded)` 
+  });
+
+  const board = root.createEl(&quot;div&quot;, { cls: &quot;kb-board&quot; });
+
+  COLUMNS.forEach(col =&gt; {
+    const colTasks = byOrder(tasks.filter(t =&gt; t.status === col.id));
+    if (!STATE.cardsToShow) STATE.cardsToShow = {};
+    const limit = STATE.cardsToShow[col.id] || DEFAULT_LIMIT;
+    const visibleTasks = colTasks.slice(0, limit);
+    const hasMore = colTasks.length &gt; limit;
+    const colEl = board.createEl(&quot;div&quot;, { cls: &quot;kb-col&quot; });
+
+    const hdr = colEl.createEl(&quot;div&quot;, { cls: &quot;kb-col-hdr&quot; });
+    const hdrLeft = hdr.createEl(&quot;div&quot;, { cls: &quot;kb-col-hdr-left&quot; });
+    const foldIcon = hdrLeft.createEl(&quot;span&quot;, { cls: &quot;kb-fold-icon&quot;, text: &quot;▼&quot; });
+    hdr.createEl(&quot;span&quot;, { text: col.label });
+    hdr.createEl(&quot;span&quot;, { cls: &quot;kb-count&quot;, text: String(colTasks.length) });
+
+    const cardList = colEl.createEl(&quot;div&quot;, { cls: &quot;kb-cards&quot; });
+
+    if (!STATE.collapsed) STATE.collapsed = {};
+    if (STATE.collapsed[col.id] === undefined) {
+	    STATE.collapsed[col.id] = false;
+    }
+    const isCollapsed = STATE.collapsed[col.id];
+    if (isCollapsed) foldIcon.textContent = &quot;▶&quot;;
+    cardList.style.display = isCollapsed ? &quot;none&quot; : &quot;flex&quot;;
+
+    hdr.style.cursor = &quot;pointer&quot;;
+    hdr.addEventListener(&quot;click&quot;, e =&gt; {
+      e.stopPropagation();
+      const newState = !STATE.collapsed[col.id];
+      STATE.collapsed[col.id] = newState;
+      foldIcon.textContent = newState ? &quot;▶&quot; : &quot;▼&quot;;
+      cardList.style.display = newState ? &quot;none&quot; : &quot;flex&quot;;
+    });
+
+    // Drop events
+    colEl.addEventListener(&quot;dragover&quot;, e =&gt; {
+      if (!DRAG.path) return;
+      e.preventDefault();
+      e.dataTransfer.dropEffect = &quot;move&quot;;
+      colEl.classList.add(&quot;kb-col-over&quot;);
+    });
+    colEl.addEventListener(&quot;dragleave&quot;, e =&gt; {
+      if (!colEl.contains(e.relatedTarget)) clearDropUI();
+    });
+    colEl.addEventListener(&quot;drop&quot;, e =&gt; {
+      e.preventDefault();
+      clearDropUI();
+      const srcPath = DRAG.path;
+      DRAG.path = null;
+      if (srcPath) commitColumnChange(srcPath, col.id);
+    });
+
+    if (visibleTasks.length === 0) {
+      cardList.createEl(&quot;div&quot;, { cls: &quot;kb-empty&quot;, text: &quot;Drop here&quot; });
+    }
+
+    // Cards
+    visibleTasks.forEach((task, idx) =&gt; {
+      const card = cardList.createEl(&quot;div&quot;, { cls: &quot;kb-card&quot; });
+      card.draggable = true;
+
+      const rootFolder = getRootFolder(task.path);
+      const borderColor = FOLDER_COLOR_MAP[rootFolder] || 'var(--interactive-accent)';
+      card.style.borderLeft = `4px solid ${borderColor}`;
+
+      card.addEventListener(&quot;dragstart&quot;, e =&gt; {
+        DRAG.path = task.path;
+        e.dataTransfer.effectAllowed = &quot;move&quot;;
+        e.dataTransfer.setData(&quot;text/plain&quot;, task.path);
+        requestAnimationFrame(() =&gt; card.classList.add(&quot;kb-dragging&quot;));
+      });
+      card.addEventListener(&quot;dragend&quot;, () =&gt; {
+        card.classList.remove(&quot;kb-dragging&quot;);
+        clearDropUI();
+        DRAG.path = null;
+      });
+
+      const top = card.createEl(&quot;div&quot;, { cls: &quot;kb-top&quot; });
+
+      if (task.progress !== null &amp;&amp; typeof task.progress === &quot;number&quot;) {
+        const progressContainer = top.createEl(&quot;div&quot;, { cls: &quot;kb-progress&quot; });
+        const filledCount = Math.min(5, Math.max(0, task.progress));
+        const filledSpan = progressContainer.createEl(&quot;span&quot;);
+        filledSpan.textContent = &quot;◉&quot;.repeat(filledCount);
+        const emptySpan = progressContainer.createEl(&quot;span&quot;);
+        emptySpan.textContent = &quot;◎&quot;.repeat(5 - filledCount);
+        const progressColor = PROGRESS_COLORS[task.progress] || &quot;var(--background-modifier-border)&quot;;
+        filledSpan.style.color = progressColor;
+        emptySpan.style.color = &quot;var(--text-faint)&quot;;
+      }
+
+      const moveWrap = top.createEl(&quot;div&quot;, { cls: &quot;kb-move&quot; });
+      const btnUp = moveWrap.createEl(&quot;button&quot;, { cls: &quot;kb-move-btn&quot;, text: &quot;↑&quot; });
+      btnUp.title = &quot;Move up&quot;;
+      if (idx === 0) btnUp.disabled = true;
+      btnUp.addEventListener(&quot;click&quot;, e =&gt; {
+        e.stopPropagation();
+        commitMove(task.path, &quot;up&quot;);
+      });
+
+      const btnDown = moveWrap.createEl(&quot;button&quot;, { cls: &quot;kb-move-btn&quot;, text: &quot;↓&quot; });
+      btnDown.title = &quot;Move down&quot;;
+      if (idx === colTasks.length - 1) btnDown.disabled = true;
+      btnDown.addEventListener(&quot;click&quot;, e =&gt; {
+        e.stopPropagation();
+        commitMove(task.path, &quot;down&quot;);
+      });
+
+      const a = card.createEl(&quot;a&quot;, { cls: &quot;kb-title&quot; });
+      a.textContent = task.title;
+      a.href = &quot;#&quot;;
+      a.onclick = e =&gt; {
+        e.preventDefault();
+        app.workspace.openLinkText(task.path, dv.currentFilePath, true);
+      };
+
+      if (task.tags &amp;&amp; task.tags.length) {
+        const tagContainer = card.createEl(&quot;div&quot;, { cls: &quot;kb-tag-list&quot; });
+        task.tags.forEach(tag =&gt; {
+          tagContainer.createEl(&quot;span&quot;, { cls: &quot;kb-tag&quot;, text: tag });
+        });
+      }
+    });
+
+    if (hasMore) {
+			  const loadMoreBtn = cardList.createEl(&quot;button&quot;, {
+			    cls: &quot;kb-load-more-btn&quot;,
+			    text: `Load ${Math.min(DEFAULT_LIMIT, colTasks.length - limit)} more...`
+			  });
+			  loadMoreBtn.addEventListener(&quot;click&quot;, (e) =&gt; {
+			    e.stopPropagation();
+			    STATE.cardsToShow[col.id] = (STATE.cardsToShow[col.id] || DEFAULT_LIMIT) + DEFAULT_LIMIT;
+			    renderFullBoard(); // re-render with new limit
+			  });
+			}
+  });
+}
+
+function renderConfigPanel() {
+	if (!FOLDER_COLOR_MAP) FOLDER_COLOR_MAP = {};
+	if (!PROGRESS_COLORS) PROGRESS_COLORS = {};
+  
+  const root = dv.container;
+  const configCol = root.createEl(&quot;div&quot;, { cls: &quot;kb-col kb-config-col&quot; });
+
+  const header = configCol.createEl(&quot;div&quot;, { cls: &quot;kb-col-hdr kb-config-hdr&quot; });
+  const headerLeft = header.createEl(&quot;div&quot;, { cls: &quot;kb-col-hdr-left&quot; });
+  const foldIcon = headerLeft.createEl(&quot;span&quot;, { cls: &quot;kb-fold-icon&quot;, text: &quot;▼&quot; });
+  headerLeft.createEl(&quot;span&quot;, { text: &quot; Board Settings&quot;, cls: &quot;kb-config-title&quot; });
+
+  const content = configCol.createEl(&quot;div&quot;, { cls: &quot;kb-cards kb-config-content&quot; });
+  const form = content.createEl(&quot;div&quot;, { cls: &quot;kb-config-form&quot; });
+
+  if (!STATE.collapsed) STATE.collapsed = {};
+  const panelKey = &quot;__kb_config_panel__&quot;;
+  if (STATE.collapsed[panelKey] === undefined) {
+	  STATE.collapsed[panelKey] = true;
+  }
+  const isCollapsed = STATE.collapsed[panelKey];
+  if (isCollapsed) {
+    foldIcon.textContent = &quot;▶&quot;;
+    content.style.display = &quot;none&quot;;
+  }
+
+  header.style.cursor = &quot;pointer&quot;;
+  header.addEventListener(&quot;click&quot;, e =&gt; {
+    e.stopPropagation();
+    const newState = !STATE.collapsed[panelKey];
+    STATE.collapsed[panelKey] = newState;
+    foldIcon.textContent = newState ? &quot;▶&quot; : &quot;▼&quot;;
+    content.style.display = newState ? &quot;none&quot; : &quot;flex&quot;;
+  });
+
+  // Form fields (populated with current config)
+  form.createEl(&quot;label&quot;, { text: &quot;Main Folder&quot; });
+  const folderInput = form.createEl(&quot;input&quot;, { type: &quot;text&quot;, placeholder: &quot;/&quot;, cls: &quot;kb-config-input&quot; });
+  folderInput.value = FOLDER;
+
+  form.createEl(&quot;label&quot;, { text: &quot;Exclude Paths (comma separated)&quot; });
+  const excludePathsInput = form.createEl(&quot;textarea&quot;, { placeholder: &quot;_templates/, attachments/, ...&quot;, cls: &quot;kb-config-textarea&quot; });
+  excludePathsInput.value = EXCLUDE_PATHS.join(&quot;, &quot;);
+
+  form.createEl(&quot;label&quot;, { text: &quot;Exclude Tags (comma separated)&quot; });
+  const excludeTagsInput = form.createEl(&quot;textarea&quot;, { placeholder: &quot;#Homepage, <a class="tag" onclick="toggleTagSearch(this)" data-content="#foldernote">#foldernote</a>&quot;, cls: &quot;kb-config-textarea&quot; });
+  excludeTagsInput.value = EXCLUDE_TAGS.join(&quot;, &quot;);
+  
+  form.createEl(&quot;label&quot;, { text: &quot;Default Cards per Column&quot; });
+  const limitInput = form.createEl(&quot;input&quot;, {
+  type: &quot;number&quot;,
+  min: 1,
+  max: 100,
+  value: String(DEFAULT_LIMIT),
+  cls: &quot;kb-config-input&quot;
+  });
+  
+  // ── Columns Editor ───────────────────────────────────────────────────────── 
+  
+  const columnsHeader = form.createEl(&quot;div&quot;, { cls: &quot;kb-config-section-header&quot; });
+	const columnsHeaderLeft = columnsHeader.createEl(&quot;div&quot;, { cls: &quot;kb-col-hdr-left&quot; });
+	const columnsFoldIcon = columnsHeaderLeft.createEl(&quot;span&quot;, { cls: &quot;kb-fold-icon&quot;, text: &quot;▶&quot; });
+	columnsHeaderLeft.createEl(&quot;span&quot;, { text: &quot; Columns&quot;, cls: &quot;kb-config-section-title&quot; });
+	
+	const columnsContent = form.createEl(&quot;div&quot;, { cls: &quot;kb-config-section-content&quot; });
+	columnsContent.style.display = &quot;none&quot;; // collapsed by default
+	
+	const columnsContainer = columnsContent.createEl(&quot;div&quot;, { cls: &quot;kb-config-list&quot; });
+	
+	// State key
+	const columnsSectionKey = &quot;__kb_config_columns__&quot;;
+	if (STATE.collapsed[columnsSectionKey] === undefined) {
+	  STATE.collapsed[columnsSectionKey] = true; // default collapsed
+	}
+	const columnsCollapsed = STATE.collapsed[columnsSectionKey];
+	if (!columnsCollapsed) {
+	  columnsFoldIcon.textContent = &quot;▼&quot;;
+	  columnsContent.style.display = &quot;block&quot;;
+	}
+	
+	columnsHeader.style.cursor = &quot;pointer&quot;;
+	columnsHeader.addEventListener(&quot;click&quot;, (e) =&gt; {
+	  e.stopPropagation();
+	  const newState = !STATE.collapsed[columnsSectionKey];
+	  STATE.collapsed[columnsSectionKey] = newState;
+	  columnsFoldIcon.textContent = newState ? &quot;▶&quot; : &quot;▼&quot;;
+	  columnsContent.style.display = newState ? &quot;none&quot; : &quot;block&quot;;
+	});
+
+function renderColumnsEditor() {
+  columnsContainer.empty();
+  COLUMNS.forEach((col, index) =&gt; {
+    const row = columnsContainer.createEl(&quot;div&quot;, { cls: &quot;kb-config-row&quot; });
+    
+    const idInput = row.createEl(&quot;input&quot;, {
+      type: &quot;text&quot;,
+      value: col.id,
+      placeholder: &quot;id&quot;,
+      cls: &quot;kb-config-input-small&quot;
+    });
+    const labelInput = row.createEl(&quot;input&quot;, {
+      type: &quot;text&quot;,
+      value: col.label,
+      placeholder: &quot;Label&quot;,
+      cls: &quot;kb-config-input-small&quot;
+    });
+    
+    const removeBtn = row.createEl(&quot;button&quot;, {
+      text: &quot;✕&quot;,
+      cls: &quot;kb-config-remove-btn&quot;
+    });
+    removeBtn.addEventListener(&quot;click&quot;, () =&gt; {
+      COLUMNS.splice(index, 1);
+      renderColumnsEditor();
+    });
+    
+    // Update the column object on input change
+    idInput.addEventListener(&quot;input&quot;, () =&gt; { col.id = idInput.value; });
+    labelInput.addEventListener(&quot;input&quot;, () =&gt; { col.label = labelInput.value; });
+  });
+  
+  const addBtn = columnsContainer.createEl(&quot;button&quot;, {
+    text: &quot;+ Add Column&quot;,
+    cls: &quot;kb-config-add-btn&quot;
+  });
+  addBtn.addEventListener(&quot;click&quot;, () =&gt; {
+    COLUMNS.push({ id: &quot;new&quot;, label: &quot;New Column&quot; });
+    renderColumnsEditor();
+  });
+}
+
+// Initial render
+renderColumnsEditor();
+
+// ── Folder Colors Editor ───────────────────────────────────────────────────
+const colorsHeader = form.createEl(&quot;div&quot;, { cls: &quot;kb-config-section-header&quot; });
+const colorsHeaderLeft = colorsHeader.createEl(&quot;div&quot;, { cls: &quot;kb-col-hdr-left&quot; });
+const colorsFoldIcon = colorsHeaderLeft.createEl(&quot;span&quot;, { cls: &quot;kb-fold-icon&quot;, text: &quot;▶&quot; });
+colorsHeaderLeft.createEl(&quot;span&quot;, { text: &quot; Folder Colors&quot;, cls: &quot;kb-config-section-title&quot; });
+
+const colorsContent = form.createEl(&quot;div&quot;, { cls: &quot;kb-config-section-content&quot; });
+colorsContent.style.display = &quot;none&quot;;
+const colorsContainer = colorsContent.createEl(&quot;div&quot;, { cls: &quot;kb-config-list&quot; });
+const colorsSectionKey = &quot;__kb_config_colors__&quot;;
+if (STATE.collapsed[colorsSectionKey] === undefined) {
+  STATE.collapsed[colorsSectionKey] = true;
+}
+const colorsCollapsed = STATE.collapsed[colorsSectionKey];
+if (!colorsCollapsed) {
+  colorsFoldIcon.textContent = &quot;▼&quot;;
+  colorsContent.style.display = &quot;block&quot;;
+}
+
+colorsHeader.style.cursor = &quot;pointer&quot;;
+colorsHeader.addEventListener(&quot;click&quot;, (e) =&gt; {
+  e.stopPropagation();
+  const newState = !STATE.collapsed[colorsSectionKey];
+  STATE.collapsed[colorsSectionKey] = newState;
+  colorsFoldIcon.textContent = newState ? &quot;▶&quot; : &quot;▼&quot;;
+  colorsContent.style.display = newState ? &quot;none&quot; : &quot;block&quot;;
+});
+
+// Convert FOLDER_COLOR_MAP (object) to array for editing
+let folderColorsArray = Object.entries(FOLDER_COLOR_MAP).map(([folder, color]) =&gt; ({ folder, color }));
+
+function renderColorsEditor() {
+  colorsContainer.empty();
+  folderColorsArray.forEach((item, index) =&gt; {
+    const row = colorsContainer.createEl(&quot;div&quot;, { cls: &quot;kb-config-row&quot; });
+    
+    const folderInput = row.createEl(&quot;input&quot;, {
+      type: &quot;text&quot;,
+      value: item.folder,
+      placeholder: &quot;Folder&quot;,
+      cls: &quot;kb-config-input-small&quot;
+    });
+    
+    const colorPicker = row.createEl(&quot;input&quot;, {
+      type: &quot;color&quot;,
+      value: item.color,
+      cls: &quot;kb-config-color-picker&quot;
+    });
+    
+    const colorText = row.createEl(&quot;input&quot;, {
+      type: &quot;text&quot;,
+      value: item.color,
+      placeholder: &quot;#RRGGBB&quot;,
+      cls: &quot;kb-config-input-small&quot;
+    });
+    
+    // Sync color picker and text field
+    colorPicker.addEventListener(&quot;input&quot;, () =&gt; {
+      colorText.value = colorPicker.value;
+      item.color = colorPicker.value;
+    });
+    colorText.addEventListener(&quot;input&quot;, () =&gt; {
+      colorPicker.value = colorText.value;
+      item.color = colorText.value;
+    });
+    folderInput.addEventListener(&quot;input&quot;, () =&gt; { item.folder = folderInput.value; });
+    
+    const removeBtn = row.createEl(&quot;button&quot;, {
+      text: &quot;✕&quot;,
+      cls: &quot;kb-config-remove-btn&quot;
+    });
+    removeBtn.addEventListener(&quot;click&quot;, () =&gt; {
+      folderColorsArray.splice(index, 1);
+      renderColorsEditor();
+    });
+  });
+  
+  const addBtn = colorsContainer.createEl(&quot;button&quot;, {
+    text: &quot;+ Add Folder Color&quot;,
+    cls: &quot;kb-config-add-btn&quot;
+  });
+  addBtn.addEventListener(&quot;click&quot;, () =&gt; {
+    folderColorsArray.push({ folder: &quot;NewFolder&quot;, color: &quot;#888888&quot; });
+    renderColorsEditor();
+  });
+}
+
+renderColorsEditor();
+
+// ── Progress Colors Editor ───────────────────────────────────────────────────
+
+const progressHeader = form.createEl(&quot;div&quot;, { cls: &quot;kb-config-section-header&quot; });
+const progressHeaderLeft = progressHeader.createEl(&quot;div&quot;, { cls: &quot;kb-col-hdr-left&quot; });
+const progressFoldIcon = progressHeaderLeft.createEl(&quot;span&quot;, { cls: &quot;kb-fold-icon&quot;, text: &quot;▶&quot; })
+progressHeaderLeft.createEl(&quot;span&quot;, { text: &quot; Progress Colors&quot;, cls: &quot;kb-config-section-title&quot; });
+
+const progressContent = form.createEl(&quot;div&quot;, { cls: &quot;kb-config-section-content&quot; });
+progressContent.style.display = &quot;none&quot;;
+const progressContainer = progressContent.createEl(&quot;div&quot;, { cls: &quot;kb-config-list&quot; });
+
+const progressSectionKey = &quot;__kb_config_colors__&quot;;
+if (STATE.collapsed[progressSectionKey] === undefined) {
+  STATE.collapsed[progressSectionKey] = true;
+}
+const progressCollapsed = STATE.collapsed[progressSectionKey];
+if (!progressCollapsed) {
+  progressFoldIcon.textContent = &quot;▼&quot;;
+  progressContent.style.display = &quot;block&quot;;
+}
+
+progressHeader.style.cursor = &quot;pointer&quot;;
+progressHeader.addEventListener(&quot;click&quot;, (e) =&gt; {
+  e.stopPropagation();
+  const newState = !STATE.collapsed[progressSectionKey];
+  STATE.collapsed[progressSectionKey] = newState;
+  progressFoldIcon.textContent = newState ? &quot;▶&quot; : &quot;▼&quot;;
+  progressContent.style.display = newState ? &quot;none&quot; : &quot;block&quot;;
+});
+
+// Convert PROGRESS_COLORS object to array of entries [level, color]
+let progressArray = Object.entries(PROGRESS_COLORS).map(([level, color]) =&gt; ({ level: parseInt(level), color }));
+
+function renderProgressEditor() {
+  progressContainer.empty();
+  progressArray
+  .filter(item =&gt; item.level !== 0)
+  .sort((a,b) =&gt; a.level - b.level)
+  .forEach((item) =&gt; {
+    const row = progressContainer.createEl(&quot;div&quot;, { cls: &quot;kb-config-row&quot; });
+    
+    row.createEl(&quot;span&quot;, { text: `Level ${item.level}:`, cls: &quot;kb-config-label-small&quot; });
+    
+    const colorPicker = row.createEl(&quot;input&quot;, {
+      type: &quot;color&quot;,
+      value: item.color,
+      cls: &quot;kb-config-color-picker&quot;
+    });
+    const colorText = row.createEl(&quot;input&quot;, {
+      type: &quot;text&quot;,
+      value: item.color,
+      placeholder: &quot;#RRGGBB&quot;,
+      cls: &quot;kb-config-input-small&quot;
+    });
+    
+    colorPicker.addEventListener(&quot;input&quot;, () =&gt; {
+      colorText.value = colorPicker.value;
+      item.color = colorPicker.value;
+    });
+    colorText.addEventListener(&quot;input&quot;, () =&gt; {
+      colorPicker.value = colorText.value;
+      item.color = colorText.value;
+    });
+  });
+}
+renderProgressEditor();
+
+form.createEl(&quot;label&quot;, { text: &quot;Config File Location&quot; });
+const locationText = form.createEl(&quot;div&quot;, { 
+  cls: &quot;kb-config-info-text&quot;,
+  text: CONFIG_FILE 
+}); 
+
+  const buttonRow = form.createEl(&quot;div&quot;, { cls: &quot;kb-config-buttons&quot; });
+  const saveBtn = buttonRow.createEl(&quot;button&quot;, { text: &quot;Save &amp; Refresh&quot;, cls: &quot;kb-config-save-btn&quot; });
+  const cancelBtn = buttonRow.createEl(&quot;button&quot;, { text: &quot;Cancel&quot;, cls: &quot;kb-config-cancel-btn&quot; });
+
+  saveBtn.addEventListener(&quot;click&quot;, async () =&gt; {
+  try {
+    const newFolder = folderInput.value.trim() || &quot;/&quot;;
+    const newExcludePaths = excludePathsInput.value.split(&quot;,&quot;).map(s =&gt; s.trim()).filter(s =&gt; s);
+    const newExcludeTags = excludeTagsInput.value.split(&quot;,&quot;).map(s =&gt; s.trim()).filter(s =&gt; s);
+    
+    const newDefaultLimit = parseInt(limitInput.value) || 10;
+    
+    // Columns are already updated live in the COLUMNS array
+    const newColumns = COLUMNS;
+    
+    // Convert folderColorsArray back to object
+    const newFolderColors = {};
+    folderColorsArray.forEach(item =&gt; {
+      if (item.folder.trim()) newFolderColors[item.folder.trim()] = item.color;
+    });
+    
+    // Convert progressArray back to object
+		const newProgressColors = { ...PROGRESS_COLORS };
+		progressArray.forEach(item =&gt; { newProgressColors[item.level] = item.color; });
+
+    const newConfig = {
+      folder: newFolder,
+      excludePaths: newExcludePaths,
+      excludeTags: newExcludeTags,
+      defaultCardLimit: newDefaultLimit,
+      columns: newColumns,
+      folderColors: newFolderColors,
+      progressColors: newProgressColors
+    };
+    
+
+    await saveConfig(newConfig);
+
+    // Update globals
+    FOLDER = newFolder;
+    EXCLUDE_PATHS = newExcludePaths;
+    EXCLUDE_TAGS = newExcludeTags;
+    COLUMNS = newColumns;
+    FOLDER_COLOR_MAP = newFolderColors;
+    PROGRESS_COLORS = newProgressColors;
+    DEFAULT_LIMIT = newDefaultLimit;
+    
+    STATE.cardsToShow = {};   // clear all saved limits
+
+    // Collapse panel
+    content.style.display = &quot;none&quot;;
+    STATE.collapsed[panelKey] = true;
+    foldIcon.textContent = &quot;▶&quot;;
+
+    // Refresh board
+    refreshPages();
+    renderFullBoard();
+    setTimeout(scrollToBoardTop, 20);
+
+    new Notice(&quot;Settings saved &amp; board updated.&quot;);
+  } catch (e) {
+    console.error(e);
+    new Notice(&quot;Error: &quot; + e.message);
+  }
+});
+
+  cancelBtn.addEventListener(&quot;click&quot;, () =&gt; {
+    content.style.display = &quot;none&quot;;
+    STATE.collapsed[panelKey] = true;
+    foldIcon.textContent = &quot;▶&quot;;
+  });
+}
+
+function scrollToBoardTop() {
+  const boardEl = dv.container.closest('.markdown-preview-view') || dv.container;
+  boardEl.scrollTop = 0;
+  // Alternative: scroll the container itself
+  dv.container.scrollIntoView({ behavior: 'auto', block: 'start' });
+}
+
+function renderFullBoard() {
+  const root = dv.container;
+  root.empty();
+  renderConfigPanel();
+  renderBoard();
+  setTimeout(scrollToBoardTop, 20);
+}
+
+// ───────────────────────────────────────────────────────────────────────────────
+// 8. Initialisation
+// ───────────────────────────────────────────────────────────────────────────────
+(async () =&gt; {
+  await loadConfig();
+  refreshPages();
+  renderFullBoard();
+})();
+
+&lt;/div&gt;&lt;/div&gt;
+ 
+
+&lt;/div&gt;
+</code></pre>
 <script>lucide.createIcons({attrs:{class:["svg-icon"]}})</script>
-</body>
 </html>
